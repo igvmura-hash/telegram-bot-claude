@@ -117,8 +117,12 @@ Igor ведёт:
             messages=history,
         )
 
-        # Get response text
-        assistant_message = response.content[0].text
+        # Get response text (claude-sonnet-5 uses adaptive thinking by default,
+        # so content[0] can be a ThinkingBlock instead of the text block)
+        assistant_message = next(
+            (block.text for block in response.content if getattr(block, "type", None) == "text"),
+            "",
+        )
 
         # Add response to history
         add_to_history(chat_id, "assistant", assistant_message)
