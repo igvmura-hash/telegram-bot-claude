@@ -5,12 +5,10 @@ Receives messages in Telegram, sends to Claude, returns responses
 """
 
 import os
-import json
 import logging
 from typing import Optional
+import requests
 from flask import Flask, request
-from telegram import Bot, Update
-from telegram.error import TelegramError
 from anthropic import Anthropic
 
 # Setup logging
@@ -20,9 +18,9 @@ logger = logging.getLogger(__name__)
 # Initialize Flask app
 app = Flask(__name__)
 
-# Initialize Telegram bot
+# Telegram config
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-bot = Bot(token=TELEGRAM_TOKEN)
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # Initialize Anthropic client
 client = Anthropic()
@@ -31,11 +29,13 @@ client = Anthropic()
 conversation_history = {}
 MAX_HISTORY = 10  # Keep last 10 messages per conversation
 
+
 def get_conversation_history(chat_id: int) -> list:
     """Get conversation history for a user"""
     if chat_id not in conversation_history:
         conversation_history[chat_id] = []
     return conversation_history[chat_id]
+
 
 def add_to_history(chat_id: int, role: str, content: str):
     """Add message to conversation history"""
@@ -45,6 +45,39 @@ def add_to_history(chat_id: int, role: str, content: str):
     # Keep only last MAX_HISTORY messages
     if len(history) > MAX_HISTORY:
         conversation_history[chat_id] = history[-MAX_HISTORY:]
+
+
+def send_telegram_message(chat_id: int, text: str):
+    """Send a message to a Telegram chat via the raw Bot API"""
+    try:
+        resp = requests.post(
+            f"{TELEGRAM_API_URL}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            # Markdown parsing can fail on odd characters - retry as plain text
+            logger.warning(f"Markdown send failed ({resp.status_code}), retrying as plain text")
+            requests.post(
+                f"{TELEGRAM_API_URL}/sendMessage",
+                json={"chat_id": chat_id, "text": text},
+                timeout=15,
+            )
+    except Exception as e:
+        logger.error(f"Failed to send Telegram message: {e}")
+
+
+def send_typing_action(chat_id: int):
+    """Show the 'typing...' indicator in Telegram"""
+    try:
+        requests.post(
+            f"{TELEGRAM_API_URL}/sendChatAction",
+            json={"chat_id": chat_id, "action": "typing"},
+            timeout=10,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to send typing action: {e}")
+
 
 def get_claude_response(user_message: str, chat_id: int, user_name: Optional[str] = None) -> str:
     """Send message to Claude and get response"""
@@ -56,7 +89,7 @@ def get_claude_response(user_message: str, chat_id: int, user_name: Optional[str
         history = get_conversation_history(chat_id)
 
         # System prompt
-        system_prompt = f"""Ты помощник Igor в его реальном бизнесе недвижимости (moscowestate).
+        system_prompt = """Ты помощник Igor в его реальном бизнесе недвижимости (moscowestate).
 
 Igor ведёт:
 - Проект Рожново (15 домов, жилой комплекс)
@@ -81,7 +114,7 @@ Igor ведёт:
             model="claude-3-5-sonnet-20241022",
             max_tokens=1024,
             system=system_prompt,
-            messages=history
+            messages=history,
         )
 
         # Get response text
@@ -96,92 +129,89 @@ Igor ведёт:
         logger.error(f"Error calling Claude API: {e}")
         return f"❌ Ошибка обработки: {str(e)}"
 
+
 @app.route("/", methods=["GET"])
 def home():
     """Health check endpoint"""
     return {"status": "ok", "bot": "Igor's Telegram Bot is running"}, 200
 
+
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     """Telegram webhook endpoint"""
     try:
-        update_data = request.get_json()
-        update = Update.de_json(update_data, bot)
+        update = request.get_json(silent=True)
 
         if not update:
             return {"ok": False}, 400
 
+        message = update.get("message")
+
         # Handle message updates
-        if update.message and update.message.text:
-            chat_id = update.message.chat_id
-            user_id = update.message.from_user.id
-            user_name = update.message.from_user.first_name
-            user_message = update.message.text
+        if message and message.get("text"):
+            chat_id = message["chat"]["id"]
+            from_user = message.get("from", {}) or {}
+            user_id = from_user.get("id")
+            user_name = from_user.get("first_name", "")
+            user_message = message["text"]
 
             logger.info(f"Message from {user_name} (ID: {user_id}): {user_message}")
 
             # Show typing indicator
-            bot.send_chat_action(chat_id, "typing")
+            send_typing_action(chat_id)
 
             # Get Claude response
-            response = get_claude_response(user_message, chat_id, user_name)
+            response_text = get_claude_response(user_message, chat_id, user_name)
 
             # Send response back to user
-            bot.send_message(
-                chat_id=chat_id,
-                text=response,
-                parse_mode="Markdown"
-            )
+            send_telegram_message(chat_id, response_text)
 
             logger.info(f"Response sent to {user_name}")
 
         return {"ok": True}, 200
 
-    except TelegramError as e:
-        logger.error(f"Telegram error: {e}")
-        return {"ok": False, "error": str(e)}, 400
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         return {"ok": False, "error": str(e)}, 500
 
-@app.route("/set_webhook", methods=["POST"])
+
+@app.route("/set_webhook", methods=["GET", "POST"])
 def set_webhook():
-    """Manually set webhook (call once to activate)"""
+    """Set the Telegram webhook (call once, or after redeploy, to activate)"""
     try:
-        webhook_url = os.getenv("RAILWAY_PUBLIC_DOMAIN")
-        if not webhook_url:
+        webhook_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
+        if not webhook_domain:
             return {"error": "RAILWAY_PUBLIC_DOMAIN not set"}, 400
 
-        # Format webhook URL
-        full_url = f"https://{webhook_url}/webhook/{TELEGRAM_TOKEN}"
+        full_url = f"https://{webhook_domain}/webhook/{TELEGRAM_TOKEN}"
 
-        # Set webhook
-        bot.set_webhook(url=full_url)
+        resp = requests.post(
+            f"{TELEGRAM_API_URL}/setWebhook",
+            json={"url": full_url},
+            timeout=15,
+        )
+        data = resp.json()
 
         return {
-            "ok": True,
+            "ok": data.get("ok", False),
             "webhook_url": full_url,
-            "message": "Webhook set successfully"
+            "telegram_response": data,
         }, 200
 
     except Exception as e:
         logger.error(f"Error setting webhook: {e}")
         return {"ok": False, "error": str(e)}, 400
 
+
 @app.route("/webhook_info", methods=["GET"])
 def webhook_info():
     """Get current webhook info"""
     try:
-        info = bot.get_webhook_info()
-        return {
-            "url": info.url,
-            "has_custom_certificate": info.has_custom_certificate,
-            "pending_update_count": info.pending_update_count,
-            "last_error_date": info.last_error_date,
-            "last_error_message": info.last_error_message,
-        }, 200
+        resp = requests.get(f"{TELEGRAM_API_URL}/getWebhookInfo", timeout=15)
+        return resp.json(), 200
     except Exception as e:
         return {"error": str(e)}, 400
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
